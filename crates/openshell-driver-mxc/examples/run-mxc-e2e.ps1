@@ -32,7 +32,7 @@
 #   fs-rw            - in-policy write to DemoDir succeeds.
 #   fs-readonly      - write to read-only dir is denied; control write succeeds.
 #   fs-default-deny  - ungranted write is denied after the agent launches.
-#                      processcontainer only.
+#                      isolation_session requires an owner-private -DemoDir.
 #   network-policy   - supervisor-owned network policy permits admission.
 #   forwarding       - two TCP request/reply exchanges through OpenShell ingress.
 #   service-forwarding - named HTTP service routing and endpoint deletion.
@@ -49,7 +49,10 @@ param(
     [string] $Scenario,
     [int]    $Port        = 17670,
     [string] $GatewayName = "openshell-mxc-e2e",
-    [switch] $KeepRunning
+    [switch] $KeepRunning,
+    # Run only the scenarios that apply to -Backend instead of reporting the
+    # others as SKIP (which makes the run INCOMPLETE).
+    [switch] $ApplicableOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -295,6 +298,11 @@ $gwErrLog = $null
 function Render-Toml {
     $t = $tomlBase
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*backend\s*=.*$', "backend = `"$Backend`"")
+    if ($Backend -eq "isolation_session") {
+        # The agent session network is unrestricted; the driver requires the operator
+        # to acknowledge that only proxy-aware traffic is mediated.
+        $t = [regex]::Replace($t, '(?m)^backend\s*=.*$', "$&`nisolation_session_unfenced_network = true")
+    }
     $wxcLine = "wxc_exec_path = `"$(Esc $WxcExecPath)`""
     $t = [regex]::Replace($t, '(?m)^\s*#?\s*wxc_exec_path\s*=.*$', $wxcLine)
     $t += @"
@@ -739,6 +747,15 @@ try {
     Ok "port $Port free"
 
     Step "Prepare DemoDir + read-only source + deny-probe dir"
+    if ($Backend -eq "isolation_session") {
+        # Outside its brokered (BFS) grants an isolation-session agent keeps its
+        # own ACL rights. A DemoDir that every user can write would make the
+        # deny scenarios meaningless, so require an owner-private location.
+        $profileRoot = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\') + '\'
+        if (-not [IO.Path]::GetFullPath($DemoDir).StartsWith($profileRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "isolation_session E2E requires -DemoDir under the owner's profile ($env:USERPROFILE)."
+        }
+    }
     New-Item -ItemType Directory -Force $DemoDir   | Out-Null
     New-Item -ItemType Directory -Force $roSrc     | Out-Null
     New-Item -ItemType Directory -Force $denyProbe | Out-Null
@@ -771,7 +788,7 @@ try {
         @{
             Name = "fs-default-deny"; PolicyFile = Join-Path $policyDir "fs-empty.yaml"
             SandboxId = "fd"
-            Backends = "process_container"; Kind = "deny"
+            Backends = "both"; Kind = "deny"
             DenyTarget    = (Join-Path $denyProbe "fs-default-deny-denied.txt")
             Description = "empty policy; ungranted write denied"
         },
@@ -847,6 +864,10 @@ try {
 
             $skipReason = $null
             $backendMatches = ($sc.Backends -eq "both") -or ($sc.Backends -eq $Backend)
+            if ($ApplicableOnly -and -not $backendMatches) {
+                Info "$($sc.Name): not applicable to backend=$Backend"
+                continue
+            }
             if (-not $backendMatches) {
                 $skipReason = "scenario requires backend=$($sc.Backends); current backend=$Backend"
             } elseif (-not $backendProbe.Live) {

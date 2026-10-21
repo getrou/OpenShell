@@ -18,8 +18,12 @@ allow_driver_config = true
 # Path to wxc-exec.exe. Required for real runtime tests; mocks are not E2E.
 wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
-# The RFC 0012 MXC runtime requires ProcessContainer.
+# process_container (default) or isolation_session. isolation_session runs the
+# sandbox as a separate agent user and brokers filesystem grants to it (BFS);
+# it requires isolation_session_unfenced_network = true because the agent
+# session's network is unrestricted.
 backend = "process_container"
+# isolation_session_unfenced_network = false
 
 # The packaged runtime binaries default to siblings of openshell-gateway.exe.
 # Override these paths when running from a different development layout.

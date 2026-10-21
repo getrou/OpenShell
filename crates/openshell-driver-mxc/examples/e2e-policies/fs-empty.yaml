@@ -5,7 +5,8 @@
 #
 # No paths are granted. With processcontainer (AppContainer), every write is
 # denied by the OS without any host ACL configuration — genuine default-deny.
-# This scenario is processcontainer-only (isolation_session has no deny primitive).
+# With isolation_session the agent user keeps its own ACL rights, so the denied
+# write targets an owner-private path that only a brokered (BFS) grant could open.
 # Used by the fs-default-deny-empty scenario in run-mxc-e2e.ps1.
 version: 1
 
