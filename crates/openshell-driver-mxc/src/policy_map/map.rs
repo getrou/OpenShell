@@ -138,10 +138,23 @@ fn build_split_mxc_config(
     }
 
     let filesystem = map_filesystem(policy, opts, items);
-    add_backend_filesystem_loss(policy, &opts.containment, items);
+    add_backend_filesystem_loss(policy, &opts.containment, true, items);
 
     let proxy_supported = matches!(opts.containment.as_str(), "processcontainer" | "process");
-    if !proxy_supported {
+    if opts.containment == "isolation_session" {
+        // The agent session's network is unrestricted. The host proxy still
+        // mediates proxy-aware traffic, but nothing fences direct egress; the
+        // live driver requires an explicit operator acknowledgment for this.
+        add_loss(
+            items,
+            "containment",
+            "warning",
+            "MXC isolation_session cannot fence direct egress; only proxy-aware traffic is \
+             mediated by the OpenShell host proxy.",
+            "governed egress proxy redirect",
+            "Requires isolation_session_unfenced_network = true in the MXC driver configuration.",
+        );
+    } else if !proxy_supported {
         add_loss(
             items,
             "containment",
@@ -233,7 +246,7 @@ fn build_mxc_config(
     }
 
     let filesystem = map_filesystem(policy, opts, items);
-    add_backend_filesystem_loss(policy, &opts.containment, items);
+    add_backend_filesystem_loss(policy, &opts.containment, false, items);
     let allow_rules = map_network(policy, opts, items);
     let has_direct_egress = !allow_rules.is_empty();
     let mut egress = json!({ "default": "deny" });

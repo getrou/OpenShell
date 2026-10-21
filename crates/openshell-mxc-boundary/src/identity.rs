@@ -6,8 +6,8 @@
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows::Win32::Security::{
-    GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_APPCONTAINER_INFORMATION, TOKEN_QUERY,
-    TokenAppContainerSid, TokenIsAppContainer,
+    GetLengthSid, GetTokenInformation, IsValidSid, TOKEN_APPCONTAINER_INFORMATION, TOKEN_ELEVATION,
+    TOKEN_QUERY, TOKEN_USER, TokenAppContainerSid, TokenElevation, TokenIsAppContainer, TokenUser,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -105,9 +105,111 @@ fn process_appcontainer_sid(process_id: u32) -> Result<String, String> {
     }
 }
 
+/// The measured user identity of the current process token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserIdentity {
+    pub user_sid: String,
+    pub elevated: bool,
+    pub appcontainer: bool,
+}
+
+/// Measures the current process token's user SID, elevation, and whether it is
+/// an `AppContainer` token. Used for isolation sessions, whose boundary runs as
+/// a separate agent user rather than inside an `AppContainer`.
+#[allow(unsafe_code)]
+pub fn current_user_identity() -> Result<UserIdentity, String> {
+    // SAFETY: as in `process_appcontainer_sid`: owned handles are closed by
+    // guards, query buffers are sized and aligned for the requested classes and
+    // outlive every SID pointer, and the SID extent is validated before use.
+    unsafe {
+        let process = OwnedHandle(
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION,
+                false,
+                GetCurrentProcessId(),
+            )
+            .map_err(|error| format!("open MXC process identity: {error}"))?,
+        );
+        let mut token = HANDLE::default();
+        OpenProcessToken(process.0, TOKEN_QUERY, &raw mut token)
+            .map_err(|error| format!("open MXC process token: {error}"))?;
+        let token = OwnedHandle(token);
+
+        let mut buffer = [0_usize; 32];
+        let length = u32::try_from(size_of_val(&buffer)).expect("fixed token buffer fits u32");
+        let mut returned = 0_u32;
+        GetTokenInformation(
+            token.0,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            length,
+            &raw mut returned,
+        )
+        .map_err(|error| format!("query MXC token user: {error}"))?;
+        if returned < u32::try_from(size_of::<TOKEN_USER>()).unwrap() || returned > length {
+            return Err("MXC token user buffer length is invalid".to_string());
+        }
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let start = buffer.as_ptr() as usize;
+        let end = start + returned as usize;
+        let sid = user.User.Sid.0 as usize;
+        if sid < start || sid > end.saturating_sub(8) {
+            return Err("MXC token user SID pointer is invalid".to_string());
+        }
+        let count = *user.User.Sid.0.cast::<u8>().add(1);
+        let sid_length = 8 + usize::from(count) * 4;
+        if count > 15
+            || sid_length > end - sid
+            || !IsValidSid(user.User.Sid).as_bool()
+            || GetLengthSid(user.User.Sid) as usize != sid_length
+        {
+            return Err("MXC token user SID is invalid".to_string());
+        }
+        let mut text = windows::core::PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &raw mut text)
+            .map_err(|error| format!("format MXC token user SID: {error}"))?;
+        let result = text.to_string();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        let user_sid = result.map_err(|error| format!("decode MXC token user SID: {error}"))?;
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        GetTokenInformation(
+            token.0,
+            TokenElevation,
+            Some(std::ptr::from_mut(&mut elevation).cast()),
+            u32::try_from(size_of::<TOKEN_ELEVATION>()).unwrap(),
+            &raw mut returned,
+        )
+        .map_err(|error| format!("query MXC token elevation: {error}"))?;
+
+        let mut contained = 0_u32;
+        GetTokenInformation(
+            token.0,
+            TokenIsAppContainer,
+            Some(std::ptr::from_mut(&mut contained).cast()),
+            4,
+            &raw mut returned,
+        )
+        .map_err(|error| format!("query MXC AppContainer token: {error}"))?;
+
+        Ok(UserIdentity {
+            user_sid,
+            elevated: elevation.TokenIsElevated != 0,
+            appcontainer: contained == 1,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn measures_the_current_user_identity() {
+        let identity = current_user_identity().expect("host process identity is measurable");
+        assert!(identity.user_sid.starts_with("S-1-"), "{identity:?}");
+        assert!(!identity.appcontainer);
+    }
 
     #[test]
     fn rejects_uncontained_host_process_identity() {

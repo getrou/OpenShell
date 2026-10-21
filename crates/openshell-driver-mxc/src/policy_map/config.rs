@@ -35,6 +35,10 @@ pub fn filesystem_default_deny_message(containment: &str) -> String {
         "seatbelt" => "Seatbelt starts from a deny-default profile with baseline system \
             allowances, not OpenShell Landlock."
             .to_owned(),
+        "isolation_session" => "IsolationSession starts from the agent user's own ACL \
+            rights, not default-deny; filesystem grants are brokered from the gateway user \
+            through BFS."
+            .to_owned(),
         _ => "MXC filesystem behavior is backend-specific and not equivalent to \
             OpenShell Landlock by construction."
             .to_owned(),
@@ -107,9 +111,14 @@ pub fn add_backend_network_loss(
 
 /// Reject filesystem grants on stable-schema backends that cannot enforce
 /// them. Empty filesystem lists remain valid because they do not claim a grant.
+///
+/// `brokered` selects the MXC 1.1.0-alpha `isolation_session` provision used by
+/// the live driver, which enforces grants by brokering each path from the
+/// gateway user to the agent user (BFS). The stable 1.0 mapping cannot.
 pub fn add_backend_filesystem_loss(
     policy: &SandboxPolicy,
     containment: &str,
+    brokered: bool,
     items: &mut Vec<LossItem>,
 ) {
     let Some(filesystem) = &policy.filesystem else {
@@ -120,6 +129,18 @@ pub fn add_backend_filesystem_loss(
             || !filesystem.read_only.is_empty()
             || !filesystem.read_write.is_empty())
     {
+        if brokered {
+            add_loss(
+                items,
+                "filesystem_policy.grants",
+                "info",
+                "isolation_session filesystem grants are brokered from the gateway user to the \
+                 agent user through BFS; the agent user's own ACL rights remain in effect.",
+                "filesystem path grants",
+                "Grants are bound at provision and revoked at deprovision.",
+            );
+            return;
+        }
         add_loss(
             items,
             "filesystem_policy.grants",

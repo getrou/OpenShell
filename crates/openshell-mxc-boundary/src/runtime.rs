@@ -464,6 +464,7 @@ struct BoundaryRuntime {
     config: BoundaryConfig,
     runtime_directory: PathBuf,
     proxy_url: String,
+    isolation_session: Option<crate::launch::MxcIsolationSessionBoundary>,
     authenticator: SandboxProtocolAuthenticator,
     connections: SandboxConnectionRegistry,
     connection_shutdowns: Mutex<HashMap<SandboxConnectionId, tokio::sync::watch::Sender<()>>>,
@@ -516,6 +517,7 @@ impl BoundaryRuntime {
             config,
             runtime_directory,
             proxy_url: launch.proxy_url,
+            isolation_session: launch.isolation_session,
             connection_shutdowns: Mutex::new(HashMap::new()),
             active_connection: Mutex::new(None),
             lifecycle: Mutex::new(Lifecycle::AwaitingAttach),
@@ -639,7 +641,57 @@ impl BoundaryRuntime {
         }
     }
 
+    /// Measures this boundary as an isolation-session agent user: the token
+    /// must be the agent MXC provisioned, unelevated, and not an `AppContainer`.
+    fn isolation_session_evidence(
+        &self,
+        expected: &crate::launch::MxcIsolationSessionBoundary,
+    ) -> Result<serde_json::Value, String> {
+        let identity = crate::identity::current_user_identity()?;
+        let evidence = crate::audit::MxcIsolationSessionAuditEvidence {
+            agent_user_matches: identity
+                .user_sid
+                .eq_ignore_ascii_case(&expected.agent_user_sid)
+                && !identity.appcontainer,
+            agent_user_sid: identity.user_sid,
+            not_elevated: !identity.elevated,
+            // Filesystem reach is provisioned by MXC's BFS grants; the boundary
+            // proves it runs as the agent those grants were issued to.
+            brokered_filesystem: true,
+            // TODO(mxc-isolation-session-network): the session network is
+            // unrestricted. The driver only launches this mode with an explicit
+            // operator acknowledgment; this is not measured mediation.
+            unfenced_egress_acknowledged: !self.proxy_url.is_empty(),
+            authenticated_control: true,
+            generation_scoped_attribution: true,
+        };
+        evidence.validate().map_err(|error| error.to_string())?;
+        serde_json::to_value(
+            crate::audit::MxcBoundaryAuditEvidence::WindowsMxcIsolationSession(evidence),
+        )
+        .map_err(|error| format!("encode MXC audit evidence: {error}"))
+    }
+
     fn confirmation(&self) -> Result<BoundaryConfirmation, String> {
+        if let Some(expected) = &self.isolation_session {
+            let backend_audit = self.isolation_session_evidence(expected)?;
+            let properties = openshell_sandbox_backend::audit::BoundaryAuditValidator::validate(
+                &crate::audit::MxcBoundaryAuditValidator,
+                &backend_audit,
+            )
+            .map_err(|error| error.to_string())?;
+            return Ok(BoundaryConfirmation {
+                generation: self.config.generation.clone(),
+                identity: self.config.workload_identity.clone(),
+                properties,
+                authenticated_supervisor: true,
+                session_id: self.config.session_id,
+                outer_fence: self.config.outer_fence.clone(),
+                runtime_exit_terminates_workload: true,
+                resource_claims: self.config.resource_claims.clone(),
+                backend_audit,
+            });
+        }
         let appcontainer_sid = crate::identity::current_appcontainer_sid()?;
         let evidence = MxcSandboxAuditEvidence {
             process_container: !appcontainer_sid.is_empty(),

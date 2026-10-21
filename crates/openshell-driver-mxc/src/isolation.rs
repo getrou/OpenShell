@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use openshell_isolation_interface::contract::{
     BackendError, OuterFenceGuarantee, OuterFenceGuarantees, ResolvedWorkloadIdentity,
 };
-use openshell_mxc_boundary::launch::{MxcBoundaryConfig, MxcLaunchDescriptor, MxcProxyConfig};
+use openshell_mxc_boundary::launch::{
+    MxcBoundaryConfig, MxcIsolationSessionBoundary, MxcLaunchDescriptor, MxcProxyConfig,
+};
 use openshell_sandbox_backend::boundary_protocol::{
     BoundaryConfig, BoundaryListener, GatewayVerificationKey, SandboxRuntimeDescriptor,
     SandboxTlsClientConfig, SandboxTlsServerConfig, SandboxTransport,
@@ -45,6 +47,9 @@ pub struct MxcBoundarySpec {
     pub proxy_url: String,
     pub workload_binary: PathBuf,
     pub child_env: HashMap<String, String>,
+    /// Agent user SID minted by an MXC isolation-session provision; `None`
+    /// for a `ProcessContainer` boundary.
+    pub isolation_session_agent_sid: Option<String>,
 }
 
 pub struct MxcBoundaryProvisioning {
@@ -63,15 +68,22 @@ impl MxcBoundarySpec {
                 "MXC control and proxy listeners must use concrete loopback ports".to_string(),
             ));
         }
-        let resource_digest = format!("mxc-processcontainer:{}", self.generation);
+        let isolation_session = self.isolation_session_agent_sid.is_some();
+        let (containment, identity_source) = if isolation_session {
+            ("isolation_session", "mxc-isolation-session-agent-user")
+        } else {
+            ("processcontainer", "mxc-appcontainer")
+        };
+        let resource_digest = format!("mxc-{containment}:{}", self.generation);
         // The common identity envelope is numeric for Unix backends. MXC binds
-        // its AppContainer token through the source and resource digest while
-        // using reserved nonzero numeric sentinels for the common fields.
+        // its AppContainer token (or isolation-session agent user) through the
+        // source and resource digest while using reserved nonzero numeric
+        // sentinels for the common fields.
         let workload_identity = ResolvedWorkloadIdentity::new(
             1,
             1,
             Vec::new(),
-            "mxc-appcontainer".to_string(),
+            identity_source.to_string(),
             resource_digest,
         )?;
         let resource_claims = BTreeMap::from([
@@ -85,14 +97,29 @@ impl MxcBoundarySpec {
                 self.boundary_id.clone(),
             ),
         ]);
-        let evidence = serde_json::to_vec(&MxcOuterFenceEvidence {
-            compatibility_assertion: "windows-parity-unverified-egress-and-revocation",
-            generation: &self.generation,
-            containment: "process_container",
-            default_deny_filesystem: true,
-            default_deny_egress: true,
-            loopback_proxy_only: true,
-            controller_loss_fails_closed: true,
+        // The isolation-session evidence records what that backend actually
+        // provides (no filesystem default-deny, unrestricted network); its
+        // guarantees below are the same operator-acknowledged stub.
+        let evidence = serde_json::to_vec(&if isolation_session {
+            MxcOuterFenceEvidence {
+                compatibility_assertion: "isolation-session-unfenced-network",
+                generation: &self.generation,
+                containment: "isolation_session",
+                default_deny_filesystem: false,
+                default_deny_egress: false,
+                loopback_proxy_only: false,
+                controller_loss_fails_closed: true,
+            }
+        } else {
+            MxcOuterFenceEvidence {
+                compatibility_assertion: "windows-parity-unverified-egress-and-revocation",
+                generation: &self.generation,
+                containment: "process_container",
+                default_deny_filesystem: true,
+                default_deny_egress: true,
+                loopback_proxy_only: true,
+                controller_loss_fails_closed: true,
+            }
         })
         .map_err(|error| {
             BackendError::Descriptor(format!("encode MXC outer-fence evidence: {error}"))
@@ -107,6 +134,9 @@ impl MxcBoundarySpec {
         Ok(MxcBoundaryProvisioning {
             boundary_config: MxcBoundaryConfig {
                 proxy_url: self.proxy_url,
+                isolation_session: self
+                    .isolation_session_agent_sid
+                    .map(|agent_user_sid| MxcIsolationSessionBoundary { agent_user_sid }),
                 runtime: BoundaryConfig {
                     boundary_id: self.boundary_id.clone(),
                     generation: self.generation.clone(),

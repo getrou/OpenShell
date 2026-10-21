@@ -14,6 +14,11 @@ use tracing::{debug, info};
 /// Stable MXC schema version shared by the mapper and live launcher.
 pub const MXC_SCHEMA_VERSION: &str = "1.0.0";
 
+/// MXC development schema for state-aware `isolation_session` lifecycles. Only
+/// this contract carries provision-time filesystem grants, which MXC enforces
+/// by brokering each path from the calling user to the agent user (BFS).
+pub const MXC_ISOLATION_SESSION_SCHEMA_VERSION: &str = "1.1.0-alpha";
+
 /// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
 /// `"1"`, the invoker does not spawn `wxc-exec.exe`. This wiring shim has no
 /// `AppContainer` token and must fail runtime audit before workload execution.
@@ -40,6 +45,10 @@ pub struct MxcFilesystem {
     pub readwrite_paths: Vec<String>,
     pub readonly_paths: Vec<String>,
     pub denied_paths: Vec<String>,
+    /// Directories that may be listed and traversed but not read into. Only
+    /// sent for `isolation_session`, where the sandbox working directory must
+    /// be enterable even when the policy grants none of its contents.
+    pub enumerate_paths: Vec<String>,
 }
 
 /// Network redirect fragment emitted when governed egress is enabled.
@@ -232,6 +241,117 @@ pub enum InvokerError {
     Spawn(#[from] std::io::Error),
     #[error("wxc-exec config serialization failed: {0}")]
     Serialize(#[from] serde_json::Error),
+    #[error("wxc-exec {operation} failed (exit {exit_code}): {message}")]
+    Phase {
+        operation: &'static str,
+        exit_code: i32,
+        message: String,
+    },
+    #[error("wxc-exec {0} is not available in mock mode")]
+    Mock(&'static str),
+}
+
+/// The agent identity minted by an `isolation_session` provision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationSessionProvisioned {
+    /// Opaque MXC lifecycle id addressing every later phase.
+    pub sandbox_id: String,
+    pub agent_user_name: String,
+    pub agent_user_sid: String,
+}
+
+/// The canonical unrestricted-network acknowledgment MXC requires at
+/// `isolation_session` provision: the backend cannot filter the session network.
+fn isolation_session_network_json() -> serde_json::Value {
+    serde_json::json!({
+        "egress": { "default": "allow" },
+        "ingress": { "default": "allow", "hostLoopback": "allow" },
+    })
+}
+
+fn isolation_session_provision_json(filesystem: &MxcFilesystem) -> serde_json::Value {
+    let mut filesystem_json = serde_json::Map::new();
+    if !filesystem.readwrite_paths.is_empty() {
+        filesystem_json.insert(
+            "readwritePaths".into(),
+            filesystem.readwrite_paths.clone().into(),
+        );
+    }
+    if !filesystem.readonly_paths.is_empty() {
+        filesystem_json.insert(
+            "readonlyPaths".into(),
+            filesystem.readonly_paths.clone().into(),
+        );
+    }
+    if !filesystem.enumerate_paths.is_empty() {
+        filesystem_json.insert(
+            "enumeratePaths".into(),
+            filesystem.enumerate_paths.clone().into(),
+        );
+    }
+    if !filesystem.denied_paths.is_empty() {
+        filesystem_json.insert("deniedPaths".into(), filesystem.denied_paths.clone().into());
+    }
+    let mut config = serde_json::json!({
+        "version": MXC_ISOLATION_SESSION_SCHEMA_VERSION,
+        "containment": "isolation_session",
+        "network": isolation_session_network_json(),
+    });
+    if !filesystem_json.is_empty() {
+        config["filesystem"] = serde_json::Value::Object(filesystem_json);
+    }
+    config
+}
+
+fn isolation_session_exec_json(process: &MxcProcess) -> serde_json::Value {
+    let mut process_json = serde_json::json!({
+        "commandLine": process.command_line.as_str(),
+        "cwd": process.cwd.as_str(),
+        "timeout": process.timeout,
+    });
+    if !process.env.is_empty() {
+        // The agent user's default environment cannot be replaced, only overlaid.
+        process_json["env"] = serde_json::json!(&process.env);
+        process_json["inheritDefaultEnv"] = serde_json::json!(true);
+    }
+    serde_json::json!({
+        "version": MXC_ISOLATION_SESSION_SCHEMA_VERSION,
+        "process": process_json,
+    })
+}
+
+/// Extracts a readable failure from a wxc-exec response envelope.
+fn phase_failure(
+    operation: &'static str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> InvokerError {
+    let message = serde_json::from_str::<serde_json::Value>(stdout)
+        .ok()
+        .and_then(|envelope| {
+            envelope.get("error").map(|error| {
+                let code = error
+                    .get("code")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("error");
+                let text = error.get("message").and_then(|m| m.as_str()).unwrap_or("");
+                format!("{code}: {text}")
+            })
+        })
+        .unwrap_or_else(|| {
+            let detail = if stderr.trim().is_empty() {
+                stdout
+            } else {
+                stderr
+            };
+            detail.trim().to_string()
+        });
+    InvokerError::Phase {
+        operation,
+        exit_code,
+        message,
+    }
 }
 
 // ── Invoker ───────────────────────────────────────────────────────────────────
@@ -382,6 +502,142 @@ impl WxcExecInvoker {
         let child = cmd.spawn()?;
         Ok(child)
     }
+
+    /// Runs one non-exec state-aware phase to completion and returns its
+    /// `result` object.
+    async fn run_phase(
+        &self,
+        operation: &'static str,
+        config: &serde_json::Value,
+        sandbox_id: Option<&str>,
+    ) -> Result<serde_json::Value, InvokerError> {
+        if self.mock {
+            return Err(InvokerError::Mock(operation));
+        }
+        let json = serde_json::to_string(config)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let mut cmd = Command::new(&self.exec_path);
+        cmd.kill_on_drop(true)
+            .stdin(std::process::Stdio::null())
+            .arg("--config-base64")
+            .arg(&b64)
+            .arg("--operation")
+            .arg(operation);
+        if let Some(sandbox_id) = sandbox_id {
+            cmd.arg("--container-id").arg(sandbox_id);
+        }
+        if self.debug {
+            cmd.arg("--debug");
+        }
+        debug!(operation, config = %json, "wxc-exec isolation_session phase");
+        let output = cmd.output().await?;
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let exit_code = output.status.code().unwrap_or(-1);
+        if !output.status.success() {
+            return Err(phase_failure(operation, exit_code, &stdout, &stderr));
+        }
+        if stdout.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        let envelope: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|_| phase_failure(operation, exit_code, &stdout, &stderr))?;
+        if envelope.get("error").is_some() {
+            return Err(phase_failure(operation, exit_code, &stdout, &stderr));
+        }
+        Ok(envelope
+            .get("result")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// Provisions an agent user and brokers `filesystem` to it.
+    pub async fn provision_isolation_session(
+        &self,
+        filesystem: &MxcFilesystem,
+    ) -> Result<IsolationSessionProvisioned, InvokerError> {
+        let result = self
+            .run_phase(
+                "provision",
+                &isolation_session_provision_json(filesystem),
+                None,
+            )
+            .await?;
+        let field = |value: Option<&serde_json::Value>, name: &str| {
+            value
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| InvokerError::Phase {
+                    operation: "provision",
+                    exit_code: 0,
+                    message: format!("provision result is missing {name}"),
+                })
+        };
+        let metadata = result.get("metadata");
+        Ok(IsolationSessionProvisioned {
+            sandbox_id: field(result.get("sandboxId"), "sandboxId")?,
+            agent_user_name: field(
+                metadata.and_then(|m| m.get("agentUserName")),
+                "metadata.agentUserName",
+            )?,
+            agent_user_sid: field(
+                metadata.and_then(|m| m.get("agentUserSid")),
+                "metadata.agentUserSid",
+            )?,
+        })
+    }
+
+    pub async fn start_isolation_session(&self, sandbox_id: &str) -> Result<(), InvokerError> {
+        let config = serde_json::json!({ "version": MXC_ISOLATION_SESSION_SCHEMA_VERSION });
+        self.run_phase("start", &config, Some(sandbox_id))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn stop_isolation_session(&self, sandbox_id: &str) -> Result<(), InvokerError> {
+        let config = serde_json::json!({ "version": MXC_ISOLATION_SESSION_SCHEMA_VERSION });
+        self.run_phase("stop", &config, Some(sandbox_id))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn deprovision_isolation_session(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<(), InvokerError> {
+        let config = serde_json::json!({ "version": MXC_ISOLATION_SESSION_SCHEMA_VERSION });
+        self.run_phase("deprovision", &config, Some(sandbox_id))
+            .await
+            .map(|_| ())
+    }
+
+    /// Starts `process` inside a started isolation session. The returned
+    /// `wxc-exec` child relays the in-session process's output and exit code.
+    pub fn spawn_isolation_session_exec(
+        &self,
+        sandbox_id: &str,
+        process: &MxcProcess,
+    ) -> Result<tokio::process::Child, InvokerError> {
+        if self.mock {
+            return Err(InvokerError::Mock("exec"));
+        }
+        let json = serde_json::to_string(&isolation_session_exec_json(process))?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+        let mut cmd = self.real_command();
+        cmd.stdin(std::process::Stdio::null())
+            .arg("--config-base64")
+            .arg(&b64)
+            .arg("--operation")
+            .arg("exec")
+            .arg("--container-id")
+            .arg(sandbox_id);
+        if self.debug {
+            cmd.arg("--debug");
+        }
+        info!(sandbox_id, "wxc-exec isolation_session exec spawn");
+        Ok(cmd.spawn()?)
+    }
 }
 
 // ── Tests (pure serde — compile and run cross-platform) ──────────────────────
@@ -425,6 +681,62 @@ mod tests {
             CloseHandle(handle).expect("close child handle");
             assert_eq!(exited, WAIT_OBJECT_0, "cancelled launcher must terminate");
         }
+    }
+
+    #[test]
+    fn isolation_session_provision_uses_the_brokered_filesystem_contract() {
+        let config = isolation_session_provision_json(&MxcFilesystem {
+            readwrite_paths: vec!["C:\\Users\\a\\work".into()],
+            readonly_paths: vec!["C:\\Users\\a\\docs".into()],
+            denied_paths: Vec::new(),
+            enumerate_paths: vec!["C:\\Users\\a".into()],
+        });
+        assert_eq!(config["version"], MXC_ISOLATION_SESSION_SCHEMA_VERSION);
+        assert_eq!(config["containment"], "isolation_session");
+        assert_eq!(
+            config["filesystem"]["readwritePaths"][0],
+            "C:\\Users\\a\\work"
+        );
+        assert_eq!(
+            config["filesystem"]["readonlyPaths"][0],
+            "C:\\Users\\a\\docs"
+        );
+        assert!(config["filesystem"].get("deniedPaths").is_none());
+        assert_eq!(config["filesystem"]["enumeratePaths"][0], "C:\\Users\\a");
+        assert_eq!(config["network"]["egress"]["default"], "allow");
+        assert_eq!(config["network"]["ingress"]["hostLoopback"], "allow");
+        assert!(config.get("phase").is_none());
+        assert!(config.get("ui").is_none());
+    }
+
+    #[test]
+    fn isolation_session_exec_overlays_env_on_the_agent_default() {
+        let mut process = MxcProcess {
+            command_line: "C:\\Windows\\System32\\cmd.exe /c exit 0".into(),
+            cwd: "C:\\Users\\a\\work".into(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let config = isolation_session_exec_json(&process);
+        assert!(config["process"].get("env").is_none());
+        assert!(config["process"].get("inheritDefaultEnv").is_none());
+        process.env = vec!["A=1".into()];
+        let config = isolation_session_exec_json(&process);
+        assert_eq!(config["process"]["env"][0], "A=1");
+        assert_eq!(config["process"]["inheritDefaultEnv"], true);
+    }
+
+    #[test]
+    fn phase_failure_prefers_the_mxc_error_envelope() {
+        let error = phase_failure(
+            "provision",
+            1,
+            r#"{"error":{"code":"policy_validation","message":"bad path"}}"#,
+            "noise",
+        );
+        assert!(error.to_string().contains("policy_validation: bad path"));
+        let error = phase_failure("start", 2, "", "stderr text");
+        assert!(error.to_string().contains("stderr text"));
     }
 
     #[test]
@@ -487,6 +799,7 @@ mod tests {
             readwrite_paths: vec!["C:\\work\\demo".into()],
             readonly_paths: Vec::new(),
             denied_paths: Vec::new(),
+            enumerate_paths: Vec::new(),
         };
         let pc = MxcProcessContainer::default();
         let process = MxcProcess {

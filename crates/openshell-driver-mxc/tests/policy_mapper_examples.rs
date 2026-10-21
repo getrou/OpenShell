@@ -377,7 +377,7 @@ fn split_policy_deterministic() {
 }
 
 #[test]
-fn split_policy_rejects_proxy_redirect_on_isolation_session() {
+fn split_policy_brokers_filesystem_and_reports_unfenced_network_on_isolation_session() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
@@ -392,21 +392,21 @@ fn split_policy_rejects_proxy_redirect_on_isolation_session() {
         .iter()
         .filter(|i| i.severity == "error")
         .collect();
-    assert_eq!(
-        errors.len(),
-        2,
-        "expected filesystem and containment errors: {errors:?}"
-    );
-    let filesystem = errors
+    assert!(errors.is_empty(), "unexpected errors: {errors:?}");
+    let filesystem = result
+        .loss
         .iter()
         .find(|item| item.path == "filesystem_policy.grants")
-        .expect("isolation_session filesystem error");
-    assert!(filesystem.message.contains("cannot enforce"));
-    let containment = errors
+        .expect("isolation_session filesystem note");
+    assert_eq!(filesystem.severity, "info");
+    assert!(filesystem.message.contains("BFS"));
+    let containment = result
+        .loss
         .iter()
         .find(|item| item.path == "containment")
-        .expect("isolation_session proxy-containment error");
-    assert!(containment.message.contains("processcontainer"));
+        .expect("isolation_session unfenced-network warning");
+    assert_eq!(containment.severity, "warning");
+    assert!(containment.message.contains("cannot fence direct egress"));
     assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 

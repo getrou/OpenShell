@@ -157,20 +157,6 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             )
         })?;
 
-        if ctx.containment == "isolation_session"
-            && policy.filesystem.as_ref().is_some_and(|filesystem| {
-                filesystem.include_workdir
-                    || !filesystem.read_only.is_empty()
-                    || !filesystem.read_write.is_empty()
-            })
-        {
-            return Err(MapError::Unsupported(vec![LossItem {
-                rule_kind: "filesystem_policy".into(),
-                detail: "MXC 1.0 isolation_session cannot enforce OpenShell filesystem grants"
-                    .into(),
-            }]));
-        }
-
         let (config, loss, trimmed_policy, proxy_addr) = if let Some(addr) = ctx.egress {
             // Pattern C: MXC handles filesystem + a proxy redirect, while the
             // host CONNECT proxy receives the network-only trimmed policy.
@@ -327,13 +313,27 @@ mod tests {
         match err {
             MapError::Unsupported(items) => {
                 assert_eq!(items.len(), 1);
-                assert_eq!(items[0].rule_kind, "filesystem_policy");
+                assert_eq!(items[0].rule_kind, "filesystem_policy.grants");
                 assert!(items[0].detail.contains("cannot enforce"));
             }
             MapError::Internal(message) => {
                 panic!("expected unsupported filesystem policy, got internal error: {message}")
             }
         }
+    }
+
+    #[test]
+    fn embedded_brokers_filesystem_policy_on_live_isolation_session() {
+        let mapper = EmbeddedPolicyMapper;
+        let policy = fs_policy(&["C:/work/demo"], &["C:/work/demo/docs"]);
+        let ctx = MapCtx {
+            egress: Some("127.0.0.1:3128".parse().unwrap()),
+            ..demo_ctx()
+        };
+        let config = mapper.map(Some(&policy), &ctx).unwrap();
+        assert_eq!(config.readwrite_paths, vec!["C:\\work\\demo"]);
+        assert_eq!(config.readonly_paths, vec!["C:\\work\\demo\\docs"]);
+        assert!(config.ui.is_none());
     }
 
     #[test]

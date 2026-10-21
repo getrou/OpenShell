@@ -33,7 +33,10 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
 
 use crate::isolation::MxcBoundarySpec;
-use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
+use crate::mxc::{
+    IsolationSessionProvisioned, MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer,
+    WxcExecInvoker,
+};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, MappedConfig, PolicyMapper};
 
 const DRIVER_NAME: &str = "mxc";
@@ -80,6 +83,9 @@ pub struct MxcComputeConfig {
     pub pc_capabilities: Vec<String>,
     pub pc_allow_local_network: bool,
     pub pc_minimal_env: bool,
+    /// Required for `backend = "isolation_session"`: the agent session's
+    /// network is unrestricted, so only proxy-aware traffic is mediated.
+    pub isolation_session_unfenced_network: bool,
     pub debug: bool,
     pub etw_audit: bool,
 }
@@ -111,6 +117,7 @@ impl Default for MxcComputeConfig {
             pc_capabilities: Vec::new(),
             pc_allow_local_network: true,
             pc_minimal_env: false,
+            isolation_session_unfenced_network: false,
             debug: false,
             etw_audit: false,
         }
@@ -309,9 +316,13 @@ impl MxcComputeBackend {
                 .validate_configuration()
                 .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
         }
-        if self.config.backend != MxcBackend::ProcessContainer {
+        if self.config.backend == MxcBackend::IsolationSession
+            && !self.config.isolation_session_unfenced_network
+        {
             return Err(tonic::Status::failed_precondition(
-                "the RFC 0012 MXC runtime currently requires process_container",
+                "MXC isolation_session cannot fence direct network egress; set \
+                 isolation_session_unfenced_network = true to accept that only proxy-aware \
+                 traffic is mediated",
             ));
         }
         if self.gateway.endpoint.trim().is_empty() {
@@ -623,7 +634,8 @@ async fn run_lifecycle_inner(
     create_restricted_state_dir(&context.host_state_dir, "host")?;
     // This directory briefly contains the boundary TLS private key and direct
     // proxy credential. Restrict host access before writing either secret;
-    // MXC adds the ProcessContainer grant when it applies the read-write path.
+    // MXC adds the ProcessContainer grant when it applies the read-write path
+    // (or brokers it to the isolation-session agent user).
     create_restricted_state_dir(&context.boundary_state_dir, "boundary")?;
     let launch = launch_authentication(&context.sandbox).map_err(|error| error.to_string())?;
     let (control_addr, control_reservation) = reserve_loopback_port()
@@ -641,10 +653,153 @@ async fn run_lifecycle_inner(
             &MapCtx {
                 sandbox_id: context.sandbox.id.clone(),
                 egress: Some(proxy_addr),
-                containment: MxcBackend::ProcessContainer.containment().to_string(),
+                containment: context.config.backend.containment().to_string(),
             },
         )
         .map_err(|error| error.to_string())?;
+    let mut filesystem = MxcFilesystem {
+        readwrite_paths: mapped.readwrite_paths.clone(),
+        readonly_paths: mapped.readonly_paths.clone(),
+        denied_paths: Vec::new(),
+        enumerate_paths: Vec::new(),
+    };
+    push_unique_path(
+        &mut filesystem.readwrite_paths,
+        context.boundary_state_dir.display().to_string(),
+    );
+    push_unique_path(
+        &mut filesystem.readonly_paths,
+        context.config.sandbox_binary_path.clone(),
+    );
+    // An isolation-session agent can only start a process in a directory it
+    // can open. Broker the working directory for listing and traversal when no
+    // grant already covers it, without exposing its contents.
+    if context.config.backend == MxcBackend::IsolationSession
+        && !path_is_covered(
+            &context.sandbox_config.cwd,
+            filesystem
+                .readwrite_paths
+                .iter()
+                .chain(filesystem.readonly_paths.iter()),
+        )
+    {
+        push_unique_path(
+            &mut filesystem.enumerate_paths,
+            context.sandbox_config.cwd.clone(),
+        );
+    }
+    // An isolation session is provisioned before any secret is written: the
+    // agent identity it mints is part of the boundary bootstrap, and the BFS
+    // grants (including the boundary state directory) must exist before the
+    // boundary starts.
+    let isolation = match context.config.backend {
+        MxcBackend::IsolationSession => {
+            let provisioned = context
+                .invoker
+                .provision_isolation_session(&filesystem)
+                .await
+                .map_err(|error| format!("provision MXC isolation session: {error}"))?;
+            info!(
+                sandbox = %context.sandbox.name,
+                agent_user = %provisioned.agent_user_name,
+                grants = filesystem.readwrite_paths.len() + filesystem.readonly_paths.len(),
+                "MXC isolation session provisioned with brokered filesystem grants"
+            );
+            Some(provisioned)
+        }
+        MxcBackend::ProcessContainer => None,
+    };
+    let (terminated_tx, terminated_rx) = watch::channel(false);
+    let result = launch_runtime_pair(
+        context,
+        startup_guard,
+        RuntimeLaunch {
+            main,
+            workload_binary,
+            launch,
+            control_addr,
+            control_reservation,
+            proxy_addr,
+            proxy_reservation,
+            mapped,
+            filesystem,
+            isolation: isolation.clone(),
+            terminated_rx,
+        },
+    )
+    .await;
+    if let Some(isolation) = &isolation {
+        teardown_isolation_session(context, isolation).await;
+    }
+    let _ = terminated_tx.send(true);
+    result
+}
+
+struct RuntimeLaunch {
+    main: openshell_core::sandbox_env::MainProcessConfig,
+    workload_binary: PathBuf,
+    launch: openshell_core::jwt::SandboxLaunchAuthentication,
+    control_addr: SocketAddr,
+    control_reservation: std::net::TcpListener,
+    proxy_addr: SocketAddr,
+    proxy_reservation: std::net::TcpListener,
+    mapped: MappedConfig,
+    filesystem: MxcFilesystem,
+    isolation: Option<IsolationSessionProvisioned>,
+    terminated_rx: watch::Receiver<bool>,
+}
+
+/// Stops the session and removes the agent user. MXC revokes the brokered
+/// filesystem grants before removing the user; the service also revokes any
+/// left over. Failures are logged: the gateway has nothing left to retry with.
+async fn teardown_isolation_session(
+    context: &LifecycleContext,
+    isolation: &IsolationSessionProvisioned,
+) {
+    if let Err(error) = context
+        .invoker
+        .stop_isolation_session(&isolation.sandbox_id)
+        .await
+    {
+        warn!(sandbox = %context.sandbox.name, %error, "MXC isolation session stop failed");
+    }
+    match context
+        .invoker
+        .deprovision_isolation_session(&isolation.sandbox_id)
+        .await
+    {
+        Ok(()) => info!(
+            sandbox = %context.sandbox.name,
+            agent_user = %isolation.agent_user_name,
+            "MXC isolation session deprovisioned"
+        ),
+        Err(error) => warn!(
+            sandbox = %context.sandbox.name,
+            agent_user = %isolation.agent_user_name,
+            %error,
+            "MXC isolation session deprovision failed; the agent user may need manual removal"
+        ),
+    }
+}
+
+async fn launch_runtime_pair(
+    context: &LifecycleContext,
+    startup_guard: tokio::sync::OwnedMutexGuard<()>,
+    runtime: RuntimeLaunch,
+) -> Result<(), String> {
+    let RuntimeLaunch {
+        main,
+        workload_binary,
+        launch,
+        control_addr,
+        control_reservation,
+        proxy_addr,
+        proxy_reservation,
+        mapped,
+        filesystem,
+        isolation,
+        terminated_rx,
+    } = runtime;
     let tls = generate_sandbox_tls_material(launch.supervisor.session_id)
         .map_err(|error| error.to_string())?;
     let tls_cert_path = context.boundary_state_dir.join(BOUNDARY_TLS_CERT_FILE);
@@ -695,6 +850,9 @@ async fn run_lifecycle_inner(
         proxy_url,
         workload_binary,
         child_env: sandbox_environment(&context.sandbox),
+        isolation_session_agent_sid: isolation
+            .as_ref()
+            .map(|isolation| isolation.agent_user_sid.clone()),
     }
     .provision()
     .map_err(|error| error.to_string())?;
@@ -734,49 +892,57 @@ async fn run_lifecycle_inner(
         "--log-level".to_string(),
         openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
     ]);
-    let mut filesystem = MxcFilesystem {
-        readwrite_paths: mapped.readwrite_paths,
-        readonly_paths: mapped.readonly_paths,
-        denied_paths: Vec::new(),
+    let mut boundary = if let Some(isolation) = &isolation {
+        context
+            .invoker
+            .start_isolation_session(&isolation.sandbox_id)
+            .await
+            .map_err(|error| format!("start MXC isolation session: {error}"))?;
+        // The agent user's own default environment applies; the gateway user's
+        // PATH or LOCALAPPDATA would point the boundary at the wrong profile.
+        let process = MxcProcess {
+            command_line: sandbox_command,
+            cwd: context.sandbox_config.cwd.clone(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        drop(control_reservation);
+        context
+            .invoker
+            .spawn_isolation_session_exec(&isolation.sandbox_id, &process)
+            .map_err(|error| format!("start MXC isolation-session boundary: {error}"))?
+    } else {
+        let process = MxcProcess {
+            command_line: sandbox_command,
+            cwd: context.sandbox_config.cwd.clone(),
+            env: trusted_sandbox_environment(context.config.pc_minimal_env),
+            timeout: 0,
+        };
+        let network = MxcNetwork {
+            egress_default: "deny".to_string(),
+            proxy: Some(proxy_addr),
+            allow_local_network: context.config.pc_allow_local_network,
+        };
+        drop(control_reservation);
+        context
+            .invoker
+            .run_oneshot(
+                &context.sandbox.id,
+                filesystem,
+                MxcProcessContainer {
+                    least_privilege: context.config.pc_least_privilege,
+                    capabilities: context.config.pc_capabilities.clone(),
+                },
+                process,
+                Some(network),
+                mapped.ui,
+            )
+            .await
+            .map_err(|error| format!("start MXC ProcessContainer: {error}"))?
     };
-    push_unique_path(
-        &mut filesystem.readwrite_paths,
-        context.boundary_state_dir.display().to_string(),
-    );
-    push_unique_path(
-        &mut filesystem.readonly_paths,
-        context.config.sandbox_binary_path.clone(),
-    );
-    let process = MxcProcess {
-        command_line: sandbox_command,
-        cwd: context.sandbox_config.cwd.clone(),
-        env: trusted_sandbox_environment(context.config.pc_minimal_env),
-        timeout: 0,
-    };
-    let network = MxcNetwork {
-        egress_default: "deny".to_string(),
-        proxy: Some(proxy_addr),
-        allow_local_network: context.config.pc_allow_local_network,
-    };
-    drop(control_reservation);
-    let mut boundary = context
-        .invoker
-        .run_oneshot(
-            &context.sandbox.id,
-            filesystem,
-            MxcProcessContainer {
-                least_privilege: context.config.pc_least_privilege,
-                capabilities: context.config.pc_capabilities.clone(),
-            },
-            process,
-            Some(network),
-            mapped.ui,
-        )
-        .await
-        .map_err(|error| format!("start MXC ProcessContainer: {error}"))?;
     attach_child_logs(&context.sandbox.name, "sandbox", &mut boundary);
     attach_child_logs(&context.sandbox.name, "supervisor", &mut supervisor);
-    if context.config.etw_audit {
+    if context.config.etw_audit && isolation.is_none() {
         match boundary
             .id()
             .ok_or_else(|| "MXC child PID is unavailable".to_string())
@@ -802,7 +968,6 @@ async fn run_lifecycle_inner(
         }
     }
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let (terminated_tx, terminated_rx) = watch::channel(false);
     {
         let mut registry = context.registry.lock().await;
         let entry = registry
@@ -814,17 +979,21 @@ async fn run_lifecycle_inner(
     }
     drop(startup_guard);
     let result = monitor_runtime_pair(boundary, supervisor, shutdown_rx).await;
-    let _ = terminated_tx.send(true);
     if let Ok(mut attribution) = context.attribution.lock() {
         attribution.forget(&context.sandbox.id);
     }
+    let runtime = if isolation.is_some() {
+        "MXC isolation-session boundary"
+    } else {
+        "MXC ProcessContainer"
+    };
     match result {
         RuntimePairExit::Shutdown => Ok(()),
         RuntimePairExit::Boundary(status) => Err(format!(
-            "MXC ProcessContainer exited before supervisor shutdown: {status}"
+            "{runtime} exited before supervisor shutdown: {status}"
         )),
         RuntimePairExit::Supervisor(status) => Err(format!(
-            "MXC supervisor exited while ProcessContainer was active: {status}"
+            "MXC supervisor exited while {runtime} was active: {status}"
         )),
         RuntimePairExit::Wait(error) => Err(error),
     }
@@ -1071,6 +1240,25 @@ fn safe_component(value: &str) -> Result<&str, tonic::Status> {
             "sandbox ID is not safe for MXC state paths",
         ))
     }
+}
+
+/// Whether `path` is one of `grants` or lies beneath one (case-insensitive,
+/// separator-bounded), i.e. an inheriting directory grant already covers it.
+fn path_is_covered<'a>(path: &str, grants: impl IntoIterator<Item = &'a String>) -> bool {
+    let normalize = |value: &str| {
+        value
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    let path = normalize(path);
+    grants.into_iter().any(|grant| {
+        let grant = normalize(grant);
+        path == grant
+            || (path.len() > grant.len()
+                && path.starts_with(&grant)
+                && path.as_bytes()[grant.len()] == b'\\')
+    })
 }
 
 fn push_unique_path(paths: &mut Vec<String>, path: String) {
@@ -1580,6 +1768,32 @@ mod tests {
         assert!(error.message().contains("launch authentication"));
         assert!(!backend.config.state_dir.exists());
         assert!(backend.get_sandbox(&sandbox.id).await.is_none());
+    }
+
+    #[test]
+    fn working_directory_coverage_is_separator_bounded() {
+        let grants = ["C:\\work\\demo".to_string(), "c:/Tools/".to_string()];
+        assert!(path_is_covered("C:\\work\\demo", &grants));
+        assert!(path_is_covered("C:\\Work\\Demo\\sub", &grants));
+        assert!(path_is_covered("C:\\tools\\bin", &grants));
+        assert!(!path_is_covered("C:\\work\\demo2", &grants));
+        assert!(!path_is_covered("C:\\work", &grants));
+    }
+
+    #[test]
+    fn isolation_session_requires_the_unfenced_network_acknowledgment() {
+        let (mut backend, sandbox, _dir) = preflight_fixture();
+        backend.config.backend = MxcBackend::IsolationSession;
+        let error = backend.validate_sandbox_create(&sandbox).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            error
+                .message()
+                .contains("isolation_session_unfenced_network")
+        );
+        backend.config.isolation_session_unfenced_network = true;
+        backend.validate_sandbox_create(&sandbox).unwrap();
+        assert!(!backend.config.state_dir.exists());
     }
 
     #[test]

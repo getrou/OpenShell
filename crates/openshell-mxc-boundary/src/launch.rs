@@ -25,6 +25,18 @@ pub struct MxcLaunchDescriptor {
 pub struct MxcBoundaryConfig {
     pub runtime: BoundaryConfig,
     pub proxy_url: String,
+    /// Present when MXC runs this boundary inside an isolation session (a
+    /// separate agent user) rather than a `ProcessContainer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_session: Option<MxcIsolationSessionBoundary>,
+}
+
+/// The agent identity MXC minted at isolation-session provision. The boundary
+/// measures its own token against it instead of an `AppContainer` identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MxcIsolationSessionBoundary {
+    pub agent_user_sid: String,
 }
 
 impl MxcBoundaryConfig {
@@ -39,6 +51,7 @@ impl fmt::Debug for MxcBoundaryConfig {
         f.debug_struct("MxcBoundaryConfig")
             .field("runtime", &self.runtime)
             .field("proxy_url", &"<redacted>")
+            .field("isolation_session", &self.isolation_session)
             .finish()
     }
 }
