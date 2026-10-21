@@ -312,7 +312,17 @@ gateway_id = 'mxc-e2e'
 }
 
 function Test-PortListening {
-    return @([Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners() | Where-Object { $_.Port -eq $Port }).Count -gt 0
+    # GetActiveTcpListeners() intermittently omits a freshly bound listener on some Windows
+    # builds, so probe the loopback port directly.
+    $client = [Net.Sockets.TcpClient]::new()
+    try {
+        $connect = $client.ConnectAsync([Net.IPAddress]::Loopback, $Port)
+        return ($connect.Wait(500) -and $client.Connected)
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
 }
 
 function Start-Gw {
