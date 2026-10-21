@@ -118,8 +118,22 @@ debug = false
 etw_audit = false
 ```
 
-Only `process_container` supports this architecture. `isolation_session` is
-rejected during sandbox validation.
+`process_container` is the default backend. `isolation_session` runs the
+boundary as a separate agent user in its own Windows session and requires an
+MXC executor built with the 1.1.0-alpha state-aware isolation_session
+filesystem contract, plus an IsolationSession service that exposes brokered
+(BFS) filesystem access. Its semantics differ from a ProcessContainer:
+
+- `read_write` / `read_only` paths are brokered from the gateway user to the
+  agent user at provision and revoked at deprovision. The agent user otherwise
+  keeps its own ACL rights; it is not default-deny. Keep shared paths and the
+  sandbox working directory in owner-private locations.
+- The working directory is brokered list-and-traverse only when no grant
+  covers it, so the workload can start there without reading its contents.
+- The session network is unrestricted. Set
+  `isolation_session_unfenced_network = true` to accept that only proxy-aware
+  traffic is mediated by the host supervisor; sandbox validation rejects the
+  backend otherwise. Explicit UI policy and forwarding are not supported.
 
 MXC 1.0.0 is required. Pre-1.0 executors and the retired
 `default_configuration_id` setting are not supported; remove that setting

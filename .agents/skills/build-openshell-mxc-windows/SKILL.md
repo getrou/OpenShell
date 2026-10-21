@@ -342,8 +342,10 @@ signature, and `--probe` output. Remove `default_configuration_id` from gateway
 configurations: it is retired and rejected. Do not restore alpha-version or
 wildcard compatibility knobs. Standalone network mapping emits numeric CIDRs
 and TCP ports and reports unrepresentable DNS/L7 semantics as losses; full
-network governance remains in the host supervisor. IsolationSession remains
-unsupported by this runtime pair, and its filesystem grants are not enforceable.
+network governance remains in the host supervisor. The `isolation_session`
+backend requires an MXC executor with the 1.1.0-alpha brokered-filesystem
+contract and the `isolation_session_unfenced_network` opt-in; its grants are
+owner-brokered (BFS) rather than default-deny, and its network is not fenced.
 
 MXC does not support external-resource label admission. Its factory explicitly
 acknowledges admission as disabled; do not add `resource_admission` to MXC TOML
