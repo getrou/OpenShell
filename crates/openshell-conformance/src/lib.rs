@@ -438,6 +438,7 @@ impl OpenShellRunner {
         environment: Vec<(String, String)>,
         command_timeout: Duration,
     ) -> Result<CommandResult, RunnerError> {
+        let args = with_create_args(args)?;
         let context = self.context(step);
         let command = sanitized_command(&args);
         eprintln!("{context} running: {command}");
@@ -662,6 +663,37 @@ fn remaining_cleanup_time(started: Instant) -> Duration {
     CLEANUP_TIMEOUT.saturating_sub(started.elapsed())
 }
 
+/// Environment variable holding a JSON array of extra `sandbox create` arguments.
+///
+/// Compute drivers that need driver-specific create input (for example the Windows MXC driver's
+/// `--driver-config-json` with a command and working directory) can run the driver-agnostic
+/// scenarios this way.
+pub const CREATE_ARGS_ENV: &str = "OPENSHELL_CONFORMANCE_CREATE_ARGS";
+
+fn with_create_args(args: Vec<String>) -> Result<Vec<String>, RunnerError> {
+    let raw = std::env::var_os(CREATE_ARGS_ENV).map(|value| value.to_string_lossy().into_owned());
+    insert_create_args(args, raw.as_deref())
+}
+
+fn insert_create_args(args: Vec<String>, raw: Option<&str>) -> Result<Vec<String>, RunnerError> {
+    let is_create = args.len() >= 2 && args[0] == "sandbox" && args[1] == "create";
+    let Some(raw) = raw.filter(|_| is_create) else {
+        return Ok(args);
+    };
+
+    let extra: Vec<String> = serde_json::from_str(raw).map_err(|error| {
+        RunnerError::BinaryUnavailable(format!(
+            "{CREATE_ARGS_ENV} must be a JSON array of strings: {error}"
+        ))
+    })?;
+
+    let mut combined = Vec::with_capacity(args.len() + extra.len());
+    combined.extend(args[..2].iter().cloned());
+    combined.extend(extra);
+    combined.extend(args[2..].iter().cloned());
+    Ok(combined)
+}
+
 fn output_reports_not_found(result: &CommandResult) -> bool {
     result.stderr().to_ascii_lowercase().contains("not found")
         || result.stdout().to_ascii_lowercase().contains("not found")
@@ -720,6 +752,52 @@ fn shell_escape(arg: &str) -> String {
         return arg.to_string();
     }
     format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod create_args_tests {
+    use super::insert_create_args;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn inserts_after_sandbox_create() {
+        let combined = insert_create_args(
+            args(&["sandbox", "create", "--name", "x", "--detach"]),
+            Some(r#"["--driver-config-json", "{\"a\":1}"]"#),
+        )
+        .unwrap();
+        assert_eq!(
+            combined,
+            args(&[
+                "sandbox",
+                "create",
+                "--driver-config-json",
+                "{\"a\":1}",
+                "--name",
+                "x",
+                "--detach"
+            ])
+        );
+    }
+
+    #[test]
+    fn leaves_other_commands_and_unset_value_unchanged() {
+        let exec = args(&["sandbox", "exec", "--name", "x"]);
+        assert_eq!(
+            insert_create_args(exec.clone(), Some(r#"["--y"]"#)).unwrap(),
+            exec
+        );
+        let create = args(&["sandbox", "create", "--name", "x"]);
+        assert_eq!(insert_create_args(create.clone(), None).unwrap(), create);
+    }
+
+    #[test]
+    fn rejects_values_that_are_not_a_string_array() {
+        assert!(insert_create_args(args(&["sandbox", "create"]), Some("--y")).is_err());
+    }
 }
 
 #[cfg(all(test, unix))]
