@@ -12,7 +12,7 @@ pub fn smoke_fixture() -> Result<SmokeFixture, String> {
         r"C:\Windows\System32\cmd.exe".to_string(),
         "/c".to_string(),
         format!(
-            "echo ready > \"{}\" & ping -t 127.0.0.1 > NUL",
+            "echo ready > \"{}\" & set /p idle=",
             ready_path.display()
         ),
     ];
@@ -75,7 +75,7 @@ pub fn keep_alive(fixture: &SandboxFixture) -> Vec<String> {
         r"C:\Windows\System32\cmd.exe".to_string(),
         "/c".to_string(),
         format!(
-            "echo ready > \"{}\" & ping -t 127.0.0.1 > NUL",
+            "echo ready > \"{}\" & set /p idle=",
             fixture.path("ready.txt")
         ),
     ]
@@ -87,9 +87,9 @@ pub fn increment_then_wait(path: &str) -> Vec<String> {
         "/v:on".to_string(),
         "/c".to_string(),
         format!(
-            "set count=0 & if exist \"{path}\" set /p count=<\"{path}\" & \
+            "set count=0 & (if exist \"{path}\" set /p count=<\"{path}\") & \
              set /a count+=1 > NUL & >\"{path}\" echo !count! & \
-             ping -t 127.0.0.1 > NUL"
+             set /p idle="
         ),
     ]
 }
@@ -167,7 +167,7 @@ mod tests {
         let command = fixture.command().unwrap();
         assert_eq!(command[0], r"C:\Windows\System32\cmd.exe");
         assert!(command[2].contains("ready.txt"));
-        assert!(command[2].contains("ping -t 127.0.0.1"));
+        assert!(command[2].contains("set /p idle="));
 
         let policy_path = &fixture.create_args()[1];
         let policy = fs::read_to_string(policy_path).unwrap();

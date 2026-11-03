@@ -925,12 +925,13 @@ impl BoundaryRuntime {
         );
         let process_id = format!("{}:main:0", self.config.generation);
         let (program, args) = agent_command(spec.clone());
+        let (args, raw_command_tail) = cmd_verbatim_tail(&program, args);
         let process = match ManagedProcess::spawn(
             process_id.clone(),
             ProcessKindWire::Main,
             program,
             args,
-            None,
+            raw_command_tail,
             spec.workdir.clone(),
             environment,
         )
