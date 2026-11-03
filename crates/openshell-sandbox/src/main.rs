@@ -3,6 +3,10 @@
 
 //! `OpenShell` capability-free in-workload sandbox boundary.
 
+// Crate-scoped: Cargo rejects mixing `[lints] workspace = true` with a
+// crate-specific lint table (see #5188).
+#![warn(clippy::undocumented_unsafe_blocks)]
+
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
 use std::path::Path;
@@ -685,6 +689,10 @@ fn probe_socket_virtualization() -> Result<()> {
                 {
                     return Err(std::io::Error::last_os_error()).into_diagnostic();
                 }
+                // SAFETY: the retained source is the exact injected OFD and
+                // the payload buffer stays live for its declared length;
+                // MSG_NOSIGNAL keeps a refused send from raising SIGPIPE in
+                // the dispatcher thread.
                 let sent = unsafe {
                     libc::send(
                         retained.as_raw_fd(),
@@ -793,6 +801,15 @@ fn set_child_core_limit() -> std::io::Result<()> {
         .map_err(std::io::Error::from)
 }
 
+/// Reset every catchable signal disposition in the calling process to its
+/// default.
+///
+/// # Safety
+///
+/// Destroys all installed handlers for signals 1 through 64 (skipping the
+/// uncatchable SIGKILL and SIGSTOP) in the calling process. Must only run
+/// in the forked pre-exec child, never in the launcher parent, which still
+/// needs its own dispositions.
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
 unsafe fn reset_child_signal_dispositions() -> std::io::Result<()> {
@@ -1210,43 +1227,45 @@ fn probe_child_self_protection(sandbox_tgid: libc::pid_t, socket: libc::c_int) -
         )
     };
     require_probe_errno(read, libc::EPERM, "process_vm_readv sandbox")?;
-    // SAFETY: signal zero would only probe process existence if the filter did
-    // not reject the trusted sandbox target.
+    // SAFETY: signal zero would only probe process existence if the filter
+    // did not reject the trusted sandbox target.
+    let kill_result = unsafe { libc::kill(sandbox_tgid, 0) };
     require_probe_errno(
-        isize::try_from(unsafe { libc::kill(sandbox_tgid, 0) }).expect("kill result fits isize"),
+        isize::try_from(kill_result).expect("kill result fits isize"),
         libc::EPERM,
         "kill sandbox",
     )?;
     // SAFETY: scalar syscall arguments request a read-only resource query;
     // the child filter rejects non-self targets.
+    let prlimit_result = isize::try_from(unsafe {
+        libc::syscall(libc::SYS_prlimit64, sandbox_tgid, libc::RLIMIT_CORE, 0, 0)
+    })
+    .expect("prlimit result fits isize");
+    require_probe_errno(prlimit_result, libc::EPERM, "prlimit sandbox")?;
+    // SAFETY: signal zero on the process group would only probe group
+    // existence if the filter did not reject the trusted sandbox target.
+    let group_kill_result = unsafe { libc::kill(-sandbox_tgid, 0) };
     require_probe_errno(
-        isize::try_from(unsafe {
-            libc::syscall(libc::SYS_prlimit64, sandbox_tgid, libc::RLIMIT_CORE, 0, 0)
-        })
-        .expect("prlimit result fits isize"),
-        libc::EPERM,
-        "prlimit sandbox",
-    )?;
-    require_probe_errno(
-        isize::try_from(unsafe { libc::kill(-sandbox_tgid, 0) }).expect("kill result fits isize"),
+        isize::try_from(group_kill_result).expect("kill result fits isize"),
         libc::EPERM,
         "process-group signal",
     )?;
+    // SAFETY: F_SETOWN would only record the sandbox target as the owner of
+    // the child's own socket if the filter did not reject it first.
+    let fcntl_result = unsafe { libc::fcntl(socket, libc::F_SETOWN, sandbox_tgid) };
     require_probe_errno(
-        isize::try_from(unsafe { libc::fcntl(socket, libc::F_SETOWN, sandbox_tgid) })
-            .expect("fcntl result fits isize"),
+        isize::try_from(fcntl_result).expect("fcntl result fits isize"),
         libc::EPERM,
         "fcntl F_SETOWN",
     )?;
     let mut owner = sandbox_tgid;
-    require_probe_errno(
-        isize::try_from(unsafe {
-            libc::syscall(libc::SYS_ioctl, socket, 0x8901_u32, &raw mut owner)
-        })
-        .expect("ioctl result fits isize"),
-        libc::EPERM,
-        "ioctl FIOSETOWN",
-    )?;
+    // SAFETY: FIOSETOWN would only record the sandbox target as the owner of
+    // the child's own socket if the filter did not reject it first.
+    let ioctl_result = isize::try_from(unsafe {
+        libc::syscall(libc::SYS_ioctl, socket, 0x8901_u32, &raw mut owner)
+    })
+    .expect("ioctl result fits isize");
+    require_probe_errno(ioctl_result, libc::EPERM, "ioctl FIOSETOWN")?;
     Ok(())
 }
 
@@ -1959,5 +1978,169 @@ mod tests {
 
         let final_path = dest_dir.join("openshell-sandbox");
         assert!(final_path.exists(), "binary should land inside dest dir");
+    }
+
+    /// Runs `child` in a forked process and returns the bytes it writes to a
+    /// pipe. Assertions belong in the parent: a panic in the child would
+    /// unwind into a copy of the test harness.
+    #[allow(unsafe_code)]
+    fn fork_capture(child: impl FnOnce() -> Vec<u8>) -> Vec<u8> {
+        let (read_fd, write_fd) = nix::unistd::pipe().expect("create probe pipe");
+        // SAFETY: fork isolates the rlimit and seccomp changes the callers
+        // make. The child writes one result and exits without running
+        // inherited destructors or the test harness.
+        match unsafe { nix::unistd::fork() }.expect("fork should succeed") {
+            nix::unistd::ForkResult::Child => {
+                drop(read_fd);
+                let result = child();
+                let _ = rustix::io::write(&write_fd, &result);
+                drop(write_fd);
+                // SAFETY: terminate the fork child without unwinding through
+                // the parent's test harness state.
+                unsafe { libc::_exit(0) };
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                drop(write_fd);
+                let mut result = Vec::new();
+                let mut buffer = [0_u8; 512];
+                loop {
+                    match rustix::io::read(&read_fd, &mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => result.extend_from_slice(&buffer[..read]),
+                        Err(error) if error == rustix::io::Errno::INTR => {}
+                        Err(error) => panic!("read probe result: {error}"),
+                    }
+                }
+                drop(read_fd);
+                match nix::sys::wait::waitpid(child, None).expect("waitpid should succeed") {
+                    nix::sys::wait::WaitStatus::Exited(_, 0) => {}
+                    status => panic!("probe child exited unexpectedly: {status:?}"),
+                }
+                result
+            }
+        }
+    }
+
+    /// Prepares a probe child: zeroes the core-dump limit the probe requires
+    /// and allows the unprivileged seccomp install.
+    #[allow(unsafe_code)]
+    fn prepare_probe_child() -> std::io::Result<()> {
+        nix::sys::resource::setrlimit(nix::sys::resource::Resource::RLIMIT_CORE, 0, 0)
+            .map_err(std::io::Error::from)?;
+        // SAFETY: PR_SET_NO_NEW_PRIVS is a one-way scalar transition required
+        // before loading an unprivileged seccomp filter.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// The production child filter rejects every self-protection probe with
+    /// EPERM. Running `probe_child_self_protection` against that exact filter
+    /// keeps each hoisted probe result wired to its own errno check.
+    #[test]
+    fn probe_child_self_protection_accepts_the_production_child_filter() {
+        let result = fork_capture(|| {
+            if let Err(error) = prepare_probe_child() {
+                return format!("preparation failed: {error}").into_bytes();
+            }
+            let tgid = std::process::id();
+            let Ok(sandbox_tgid) = libc::pid_t::try_from(tgid) else {
+                return b"test pid does not fit pid_t".to_vec();
+            };
+            let mut program = match openshell_sandbox::linux::child_seccomp::prepare(tgid) {
+                Ok(program) => program,
+                Err(error) => return format!("prepare failed: {error}").into_bytes(),
+            };
+            if let Err(error) = program.install() {
+                return format!("install failed: {error}").into_bytes();
+            }
+            match probe_child_self_protection(sandbox_tgid, -1) {
+                Ok(()) => b"ok".to_vec(),
+                Err(error) => format!("error: {error}").into_bytes(),
+            }
+        });
+        assert_eq!(String::from_utf8_lossy(&result), "ok");
+    }
+
+    /// Denies every probe except the FIOSETOWN ioctl with EPERM; the kernel
+    /// then rejects the ioctl's invalid descriptor with EBADF. The
+    /// distinct errno only satisfies the check that belongs to the ioctl probe
+    /// when every check runs directly after its own syscall.
+    fn probe_adjacency_filter() -> seccompiler::BpfProgram {
+        use seccompiler::{
+            SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
+            SeccompRule,
+        };
+        use std::collections::BTreeMap;
+
+        let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+        rules.insert(libc::SYS_process_vm_readv, Vec::new());
+        rules.insert(libc::SYS_kill, Vec::new());
+        rules.insert(
+            libc::SYS_prlimit64,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, 0)
+                        .expect("valid prlimit64 argument condition"),
+                ])
+                .expect("valid prlimit64 rule"),
+            ],
+        );
+        rules.insert(
+            libc::SYS_fcntl,
+            vec![
+                SeccompRule::new(vec![
+                    SeccompCondition::new(
+                        1,
+                        SeccompCmpArgLen::Dword,
+                        SeccompCmpOp::Eq,
+                        u64::from(libc::F_SETOWN.cast_unsigned()),
+                    )
+                    .expect("valid fcntl command condition"),
+                ])
+                .expect("valid fcntl rule"),
+            ],
+        );
+        let architecture = std::env::consts::ARCH
+            .try_into()
+            .expect("supported target architecture");
+        SeccompFilter::new(
+            rules,
+            SeccompAction::Allow,
+            SeccompAction::Errno(libc::EPERM.cast_unsigned()),
+            architecture,
+        )
+        .expect("build probe filter")
+        .try_into()
+        .expect("compile probe filter")
+    }
+
+    #[test]
+    fn probe_child_self_protection_checks_each_syscall_errno_independently() {
+        let filter = probe_adjacency_filter();
+        let result = fork_capture(move || {
+            if let Err(error) = prepare_probe_child() {
+                return format!("preparation failed: {error}").into_bytes();
+            }
+            if let Err(error) = seccompiler::apply_filter(&filter) {
+                return format!("filter installation failed: {error}").into_bytes();
+            }
+            let Ok(sandbox_tgid) = libc::pid_t::try_from(std::process::id()) else {
+                return b"test pid does not fit pid_t".to_vec();
+            };
+            // The invalid descriptor is enough: the fcntl probe is rejected by
+            // the filter before the kernel validates it, and the unfiltered
+            // ioctl probe reports EBADF from the kernel.
+            match probe_child_self_protection(sandbox_tgid, -1) {
+                Ok(()) => b"ok".to_vec(),
+                Err(error) => format!("error: {error}").into_bytes(),
+            }
+        });
+        let result = String::from_utf8_lossy(&result);
+        assert!(
+            result.contains("ioctl FIOSETOWN was not rejected with errno"),
+            "expected the unfiltered ioctl probe to fail, got {result:?}"
+        );
     }
 }
