@@ -368,9 +368,6 @@ func checkTerminalPhase(sb *Sandbox, name string, target SandboxPhase) (*Sandbox
 	}
 	switch sb.Status.Phase {
 	case SandboxCompleted:
-		if target == SandboxReady {
-			return sb, nil
-		}
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q completed before reaching %s", name, target)}
 	case SandboxStopped:
 		return nil, &StatusError{Code: ErrorInternal, Message: fmt.Sprintf("sandbox %q stopped before reaching %s", name, target)}

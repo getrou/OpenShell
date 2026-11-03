@@ -974,7 +974,7 @@ func TestSandboxWaitReady_SandboxFailed(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestSandboxWaitReady_SandboxCompleted(t *testing.T) {
+func TestSandboxWaitReady_RejectsCompleted(t *testing.T) {
 	mock := newMockSandboxServer()
 	mock.sandboxes["complete-sb"] = &pb.Sandbox{
 		Metadata: &dm.ObjectMeta{Name: "complete-sb"},
@@ -983,10 +983,10 @@ func TestSandboxWaitReady_SandboxCompleted(t *testing.T) {
 	client, cleanup := setupSandboxTest(t, mock)
 	defer cleanup()
 
-	result, err := client.WaitReady(context.Background(), "default", "complete-sb")
+	_, err := client.WaitReady(context.Background(), "default", "complete-sb")
 
-	require.NoError(t, err)
-	assert.Equal(t, SandboxCompleted, result.Status.Phase)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "completed before reaching Ready")
 }
 
 func TestSandboxWaitReady_SandboxStopped(t *testing.T) {
