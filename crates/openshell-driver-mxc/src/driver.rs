@@ -43,6 +43,7 @@ const DRIVER_NAME: &str = "mxc";
 const DRIVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_IMAGE_SENTINEL: &str = "mxc:process-container";
 const HOST_AUTH_BUNDLE_FILE: &str = "supervisor-auth.json";
+const HOST_SSH_SERVER_NAME: &str = "supervisor-ssh";
 const HOST_RUNTIME_DESCRIPTOR_FILE: &str = "runtime-descriptor.json";
 const BOUNDARY_CONFIG_FILE: &str = "boundary.json";
 const BOUNDARY_TLS_CERT_FILE: &str = "sandbox.crt";
@@ -1034,6 +1035,13 @@ fn spawn_supervisor(
         )
         .env(openshell_core::sandbox_env::SANDBOX_ID, &context.sandbox.id)
         .env(openshell_core::sandbox_env::SANDBOX, &context.sandbox.name)
+        // Enables the supervisor's SSH server for exec, connect, and file
+        // transfer. On Windows the server is reached in process, so this path
+        // only names the server; no socket is created.
+        .env(
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            context.host_state_dir.join(HOST_SSH_SERVER_NAME),
+        )
         .env(
             openshell_core::sandbox_env::LOG_LEVEL,
             openshell_core::driver_utils::sandbox_log_level(&context.sandbox, "info"),
