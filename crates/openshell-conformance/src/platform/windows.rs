@@ -11,10 +11,7 @@ pub fn smoke_fixture() -> Result<SmokeFixture, String> {
     let command = vec![
         r"C:\Windows\System32\cmd.exe".to_string(),
         "/c".to_string(),
-        format!(
-            "echo ready > \"{}\" & set /p idle=",
-            ready_path.display()
-        ),
+        format!("echo ready > \"{}\" & set /p idle=", ready_path.display()),
     ];
     Ok(SmokeFixture::new(
         create_args,
@@ -157,6 +154,77 @@ fn writable_fixture_with_network(
     Ok((temp_dir, workload_dir, create_args))
 }
 
+const CURL: &str = r"C:\Windows\System32\curl.exe";
+
+/// Print the canonical path of the client that network-policy probes run as.
+///
+/// curl ships at a fixed System32 path, so the probe confirms it exists there
+/// rather than searching PATH; `where.exe` prints nothing inside an AppContainer.
+pub fn probe_binary_command() -> Vec<String> {
+    vec![
+        r"C:\Windows\System32\cmd.exe".to_string(),
+        "/c".to_string(),
+        format!("if exist \"{CURL}\" echo {CURL}"),
+    ]
+}
+
+/// Whether `path` is the canonical probe client path the proxy attributes.
+pub fn is_probe_binary(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let absolute =
+        (bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\') || path.starts_with(r"\\");
+    absolute
+        && !path.contains('\n')
+        && path
+            .rsplit('\\')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("curl.exe"))
+}
+
+/// Print the raw HTTP response for one request to the sandbox-local policy API.
+///
+/// Windows has no `/dev/tcp`, so the request goes through the sandbox's
+/// `http_proxy`, which is where policy.local is served.
+pub fn policy_local_request(method: &str, path: &str, body: &str) -> Vec<String> {
+    let mut argv = vec![
+        CURL.to_string(),
+        "--silent".to_string(),
+        "--include".to_string(),
+        "--max-time".to_string(),
+        "30".to_string(),
+        "--request".to_string(),
+        method.to_string(),
+        "--header".to_string(),
+        "Content-Type: application/json".to_string(),
+    ];
+    if !body.is_empty() {
+        argv.push("--data-binary".to_string());
+        argv.push(body.to_string());
+    }
+    argv.push(format!("http://policy.local{path}"));
+    argv
+}
+
+/// Open one TCP connection to `host:port`, printing `DENIED` when policy refuses
+/// it and `UNEXPECTED_ALLOWED` (exit 1) when it connects.
+///
+/// `--proxytunnel` makes curl issue a CONNECT for every scheme, so the proxy
+/// sees an L4 open just as transparent interception does on Linux.
+pub fn denied_tcp_open(host: &str, port: u16) -> Vec<String> {
+    let url = if port == 443 {
+        format!("https://{host}/")
+    } else {
+        format!("http://{host}:{port}/")
+    };
+    vec![
+        r"C:\Windows\System32\cmd.exe".to_string(),
+        "/c".to_string(),
+        format!(
+            "curl.exe --silent --proxytunnel --output NUL --max-time 20 {url} & \
+             if errorlevel 1 (echo DENIED) else (echo UNEXPECTED_ALLOWED& exit 1)"
+        ),
+    ]
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +295,33 @@ mod tests {
                 .unwrap()
                 .contains("read_write:")
         );
+    }
+
+    #[test]
+    fn probe_binary_matches_windows_curl_paths() {
+        assert!(is_probe_binary(r"C:\Windows\System32\curl.exe"));
+        assert!(is_probe_binary(r"c:\windows\system32\CURL.EXE"));
+        assert!(!is_probe_binary("curl.exe"));
+        assert!(!is_probe_binary(r"C:\Windows\System32\cmd.exe"));
+        assert!(!is_probe_binary("/usr/bin/bash"));
+    }
+
+    #[test]
+    fn network_probes_use_curl_through_the_proxy() {
+        let request = policy_local_request("POST", "/v1/proposals", "{\"a\":1}");
+        assert_eq!(request[0], CURL);
+        assert_eq!(request.last().unwrap(), "http://policy.local/v1/proposals");
+        assert!(
+            request
+                .windows(2)
+                .any(|pair| pair[0] == "--data-binary" && pair[1] == "{\"a\":1}")
+        );
+        assert!(
+            !policy_local_request("GET", "/v1/policy/current", "")
+                .contains(&"--data-binary".to_string())
+        );
+        assert!(denied_tcp_open("1.1.1.1", 443)[2].contains("--proxytunnel"));
+        assert!(denied_tcp_open("1.1.1.1", 443)[2].contains("https://1.1.1.1/"));
+        assert!(denied_tcp_open("pypi.org", 80)[2].contains("http://pypi.org:80/"));
     }
 }

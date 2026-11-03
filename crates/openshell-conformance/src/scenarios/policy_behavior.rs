@@ -48,7 +48,7 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
         let fixture = platform::policy_fixture()?;
         create_sandbox(runner, &name, &fixture).await?;
         enable_proposals(runner, &name).await?;
-        let binary = sandbox_bash_path(runner, &name).await?;
+        let binary = sandbox_probe_binary(runner, &name).await?;
 
         let started = Instant::now();
         let readiness_path = format!("/v1/proposals/ct-{}-readiness", runner.id());
@@ -97,7 +97,7 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
 
         let rule_name = format!("conformance_local_{}", runner.id());
         let payload = serde_json::json!({
-            "intent_summary": "Allow Bash to read the conformance path on example.invalid.",
+            "intent_summary": "Allow the probe client to read the conformance path on example.invalid.",
             "operations": [{
                 "addRule": {
                     "ruleName": &rule_name,
@@ -159,35 +159,28 @@ fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     })
 }
 
-async fn sandbox_bash_path(runner: &OpenShellRunner, name: &str) -> Result<String, String> {
+async fn sandbox_probe_binary(runner: &OpenShellRunner, name: &str) -> Result<String, String> {
+    let mut args = vec!["sandbox", "exec", "--name", name, "--no-tty", "--"];
+    let command = platform::probe_binary_command();
+    args.extend(command.iter().map(String::as_str));
     let result = runner
-        .step("bash-binary")
-        .description("the sandbox's Bash executable has a canonical path")
+        .step("probe-binary")
+        .description("the sandbox's network probe client has a canonical path")
         .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            name,
-            "--no-tty",
-            "--",
-            "bash",
-            "-c",
-            "printf '%s\\n' \"$(readlink -f /proc/$$/exe)\"",
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     result.require_success()?;
-    let binary = result.stdout().trim();
-    if !binary.starts_with('/')
-        || binary.contains('\n')
-        || binary.rsplit('/').next() != Some("bash")
-    {
-        return Err(result.failure_diagnostic("one absolute Bash executable path ending in /bash"));
+    let binary = result
+        .stdout()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty());
+    match binary {
+        Some(binary) if platform::is_probe_binary(binary) => Ok(binary.to_string()),
+        _ => Err(result.failure_diagnostic("one absolute probe client path")),
     }
-    Ok(binary.to_string())
 }
-
 async fn enable_proposals(runner: &OpenShellRunner, name: &str) -> Result<(), String> {
     let set = runner
         .step("enable-policy-advisor")
@@ -239,28 +232,16 @@ async fn request_policy_local_http(
     body: &str,
     expected_status: u16,
 ) -> Result<Value, String> {
-    let script = "method=$1; path=$2; body=$3; exec 3<>/dev/tcp/policy.local/80 || exit 1; printf '%s %s HTTP/1.1\\r\\nHost: policy.local\\r\\nContent-Type: application/json\\r\\nContent-Length: %s\\r\\nConnection: close\\r\\n\\r\\n' \"$method\" \"$path\" \"${#body}\" >&3; printf '%s' \"$body\" >&3; cat <&3";
+    let mut args = vec!["sandbox", "exec", "--name", sandbox, "--no-tty", "--"];
+    let command = platform::policy_local_request(method, path, body);
+    args.extend(command.iter().map(String::as_str));
     let result = runner
         .step(format!("policy-local-{method}{path}"))
         .description(format!(
             "{method} http://policy.local{path} succeeds from the sandbox"
         ))
         .with_timeout(COMMAND_TIMEOUT)
-        .run(&[
-            "sandbox",
-            "exec",
-            "--name",
-            sandbox,
-            "--no-tty",
-            "--",
-            "bash",
-            "-c",
-            script,
-            "policy-local-http",
-            method,
-            path,
-            body,
-        ])
+        .run(&args)
         .await
         .map_err(|error| error.to_string())?;
     result.require_success()?;
@@ -306,34 +287,33 @@ fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
             return Err(effective.failure_diagnostic("effective network_policies is empty"));
         }
 
+        let mut args = vec!["sandbox", "exec", "--name", &name, "--no-tty", "--"];
+        let command = platform::denied_tcp_open("1.1.1.1", 443);
+        args.extend(command.iter().map(String::as_str));
         let probe = runner
             .step("denied-tcp-open")
-            .description("one Bash TCP open to 1.1.1.1:443 is denied by policy")
+            .description("one TCP open to 1.1.1.1:443 is denied by policy")
             .with_timeout(COMMAND_TIMEOUT)
-            .run(&[
-                "sandbox",
-                "exec",
-                "--name",
-                &name,
-                "--no-tty",
-                "--",
-                "bash",
-                "-c",
-                "printf 'BINARY=%s\\n' \"$(readlink -f /proc/$$/exe)\"; if exec 3<>/dev/tcp/1.1.1.1/443; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi",
-            ])
+            .run(&args)
             .await
             .map_err(|error| error.to_string())?;
         probe.require_success()?;
-        let binary = probe
+        if !probe.stdout().lines().any(|line| line.trim() == "DENIED") {
+            return Err(probe.failure_diagnostic("TCP open is denied before any upstream dial"));
+        }
+        // Unix reports the client from the process that opened the connection;
+        // other platforms resolve the same probe client separately.
+        let binary = match probe
             .stdout()
             .lines()
             .find_map(|line| line.strip_prefix("BINARY="))
-            .filter(|binary| binary.starts_with('/') && binary.rsplit('/').next() == Some("bash"))
-            .ok_or_else(|| probe.failure_diagnostic("canonical Bash executable path is reported"))?
-            .to_string();
-        if !probe.stdout().lines().any(|line| line == "DENIED") {
-            return Err(probe.failure_diagnostic("TCP open is denied before any upstream dial"));
-        }
+        {
+            Some(binary) if platform::is_probe_binary(binary.trim()) => binary.trim().to_string(),
+            Some(_) => {
+                return Err(probe.failure_diagnostic("canonical probe client path is reported"));
+            }
+            None => sandbox_probe_binary(runner, &name).await?,
+        };
 
         await_mechanistic_draft(
             runner,
@@ -354,27 +334,20 @@ fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_>
         let fixture = platform::restricted_network_policy_fixture()?;
         let name = format!("ct-{}-nh", runner.id());
         create_sandbox(runner, &name, &fixture).await?;
-        let binary = sandbox_bash_path(runner, &name).await?;
+        let binary = sandbox_probe_binary(runner, &name).await?;
 
+        let mut args = vec!["sandbox", "exec", "--name", &name, "--no-tty", "--"];
+        let command = platform::denied_tcp_open("pypi.org", 80);
+        args.extend(command.iter().map(String::as_str));
         let probe = runner
             .step("denied-new-hostname")
-            .description("Bash cannot connect to pypi.org:80 before approval")
+            .description("the probe client cannot connect to pypi.org:80 before approval")
             .with_timeout(COMMAND_TIMEOUT)
-            .run(&[
-                "sandbox",
-                "exec",
-                "--name",
-                &name,
-                "--no-tty",
-                "--",
-                "bash",
-                "-c",
-                "if exec 3<>/dev/tcp/pypi.org/80; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi",
-            ])
+            .run(&args)
             .await
             .map_err(|error| error.to_string())?;
         probe.require_success()?;
-        if !probe.stdout().lines().any(|line| line == "DENIED") {
+        if !probe.stdout().lines().any(|line| line.trim() == "DENIED") {
             return Err(probe.failure_diagnostic("new hostname stays denied before approval"));
         }
 

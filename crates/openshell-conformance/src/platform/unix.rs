@@ -135,3 +135,46 @@ mod tests {
         assert!(policy.contains("read_write: [/sandbox, /tmp, /dev/null]"));
     }
 }
+
+/// Print the canonical path of the client that network-policy probes run as.
+pub fn probe_binary_command() -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        "printf '%s\\n' \"$(readlink -f /proc/$$/exe)\"".to_string(),
+    ]
+}
+
+/// Whether `path` is the canonical probe client path the proxy attributes.
+pub fn is_probe_binary(path: &str) -> bool {
+    path.starts_with('/') && !path.contains('\n') && path.rsplit('/').next() == Some("bash")
+}
+
+/// Print the raw HTTP response for one request to the sandbox-local policy API.
+pub fn policy_local_request(method: &str, path: &str, body: &str) -> Vec<String> {
+    [
+        "bash",
+        "-c",
+        "method=$1; path=$2; body=$3; exec 3<>/dev/tcp/policy.local/80 || exit 1; printf '%s %s HTTP/1.1\\r\\nHost: policy.local\\r\\nContent-Type: application/json\\r\\nContent-Length: %s\\r\\nConnection: close\\r\\n\\r\\n' \"$method\" \"$path\" \"${#body}\" >&3; printf '%s' \"$body\" >&3; cat <&3",
+        "policy-local-http",
+        method,
+        path,
+        body,
+    ]
+    .iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
+/// Open one TCP connection to `host:port`, printing `DENIED` when policy refuses
+/// it and `UNEXPECTED_ALLOWED` (exit 1) when it connects. Also prints the probe
+/// client as `BINARY=<path>` from the same process that opens the connection.
+pub fn denied_tcp_open(host: &str, port: u16) -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "-c".to_string(),
+        format!(
+            "printf 'BINARY=%s\\n' \"$(readlink -f /proc/$$/exe)\"; if exec 3<>/dev/tcp/{host}/{port}; then echo UNEXPECTED_ALLOWED; exit 1; else echo DENIED; fi"
+        ),
+    ]
+}
