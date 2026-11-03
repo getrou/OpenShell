@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Portable conformance scenarios exercised by the Cargo test suite.
+//! Registered, portable conformance scenarios.
 
 mod file_transfer;
 mod policy_behavior;
@@ -15,5 +15,7 @@ pub use file_transfer::{
 pub use policy_behavior::{
     MECHANISTIC_PROPOSAL_SCENARIO, NEW_HOSTNAME_PROPOSAL_SCENARIO, POLICY_LOCAL_SCENARIO,
 };
-pub use sandbox_lifecycle::SANDBOX_LIFECYCLE_SCENARIO;
-pub use smoke::SMOKE_SCENARIO;
+pub use sandbox_lifecycle::{
+    SANDBOX_LIFECYCLE_CONTROL_PLANE_SCENARIO, SANDBOX_LIFECYCLE_RESTART_PERSISTENCE_SCENARIO,
+};
+pub use smoke::{SMOKE_CONTROL_PLANE_SCENARIO, SMOKE_EXEC_SCENARIO};

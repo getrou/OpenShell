@@ -3,14 +3,13 @@
 
 //! Portable policy-local and mechanistic proposal checks.
 
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::time::sleep;
 
+use crate::platform::{self, SandboxFixture};
 use crate::{OpenShellRunner, Scenario, ScenarioFuture};
 
 const CREATE_TIMEOUT: Duration = Duration::from_mins(10);
@@ -26,33 +25,28 @@ struct SandboxState {
 }
 
 pub const POLICY_LOCAL_SCENARIO: Scenario = Scenario {
-    name: "policy-local",
+    name: "policy/local",
+    description: "Read and request a rule through the sandbox-local policy HTTP API.",
     run: run_policy_local,
 };
 
 pub const MECHANISTIC_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "mechanistic-proposal",
+    name: "policy/mechanistic-proposal",
+    description: "Turn a denied transparent TCP open into a scoped policy draft.",
     run: run_mechanistic_proposal,
 };
 
 pub const NEW_HOSTNAME_PROPOSAL_SCENARIO: Scenario = Scenario {
-    name: "new-hostname-proposal",
+    name: "policy/new-hostname-proposal",
+    description: "Turn a denied TCP open to a hostname absent from policy into a scoped draft.",
     run: run_new_hostname_proposal,
 };
-
-const EMPTY_NETWORK_POLICY: &[u8] = br"version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /bin, /lib, /lib64, /proc, /dev/urandom, /app, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock: { compatibility: best_effort }
-network_policies: {}
-";
 
 fn run_policy_local(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
         let name = format!("ct-{}-pl", runner.id());
-        create_sandbox(runner, &name, None).await?;
+        let fixture = platform::policy_fixture()?;
+        create_sandbox(runner, &name, &fixture).await?;
         enable_proposals(runner, &name).await?;
         let binary = sandbox_bash_path(runner, &name).await?;
 
@@ -289,16 +283,9 @@ async fn request_policy_local_http(
 
 fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
-        let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
-        policy
-            .write_all(EMPTY_NETWORK_POLICY)
-            .map_err(|error| error.to_string())?;
-        let policy_path = policy
-            .path()
-            .to_str()
-            .ok_or("temporary policy path is not UTF-8")?;
+        let fixture = platform::restricted_network_policy_fixture()?;
         let name = format!("ct-{}-mp", runner.id());
-        create_sandbox(runner, &name, Some(policy_path)).await?;
+        create_sandbox(runner, &name, &fixture).await?;
         enable_proposals(runner, &name).await?;
 
         let effective = runner
@@ -364,16 +351,9 @@ fn run_mechanistic_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> 
 
 fn run_new_hostname_proposal(runner: &mut OpenShellRunner) -> ScenarioFuture<'_> {
     Box::pin(async move {
-        let mut policy = NamedTempFile::new().map_err(|error| error.to_string())?;
-        policy
-            .write_all(EMPTY_NETWORK_POLICY)
-            .map_err(|error| error.to_string())?;
-        let policy_path = policy
-            .path()
-            .to_str()
-            .ok_or("temporary policy path is not UTF-8")?;
+        let fixture = platform::restricted_network_policy_fixture()?;
         let name = format!("ct-{}-nh", runner.id());
-        create_sandbox(runner, &name, Some(policy_path)).await?;
+        create_sandbox(runner, &name, &fixture).await?;
         let binary = sandbox_bash_path(runner, &name).await?;
 
         let probe = runner
@@ -489,7 +469,7 @@ fn assert_mechanistic_draft(output: &str, expected: &ExpectedDraft<'_>) -> Resul
 async fn create_sandbox(
     runner: &mut OpenShellRunner,
     name: &str,
-    policy_path: Option<&str>,
+    fixture: &SandboxFixture,
 ) -> Result<(), String> {
     runner.track_sandbox(name);
     let mut args = vec![
@@ -501,10 +481,10 @@ async fn create_sandbox(
         "--no-tty",
         "--no-auto-providers",
     ];
-    if let Some(path) = policy_path {
-        args.extend(["--policy", path]);
-    }
-    args.extend(["--", "sh", "-c", "exec sleep infinity"]);
+    args.extend(fixture.create_args().iter().map(String::as_str));
+    args.push("--");
+    let command = platform::keep_alive(fixture);
+    args.extend(command.iter().map(String::as_str));
     let create = runner
         .step("create")
         .description(format!("sandbox '{name}' is created"))
