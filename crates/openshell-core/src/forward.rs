@@ -906,7 +906,7 @@ pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
     format!("{scheme}://{}:{port}", bracket_ipv6_host(host))
 }
 
-/// Shell-escape a value for use inside a `ProxyCommand` string.
+/// POSIX shell-escape a value for use in command strings.
 pub fn shell_escape(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -923,11 +923,55 @@ pub fn shell_escape(value: &str) -> String {
     format!("'{escaped}'")
 }
 
+/// Quote one argument for the Windows command-line parser used by
+/// `CreateProcessW`-launched programs.
+///
+/// OpenSSH executes `ProxyCommand` directly on Windows instead of passing it
+/// through `/bin/sh`. Always quoting each argument keeps executable paths with
+/// spaces intact. Backslashes immediately before a quote or the closing quote
+/// are doubled according to the Windows C runtime argument parsing rules.
+#[cfg(any(windows, test))]
+fn windows_command_line_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+    let mut backslashes = 0;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let count = if character == '"' {
+            backslashes * 2 + 1
+        } else {
+            backslashes
+        };
+        escaped.extend(std::iter::repeat_n('\\', count));
+        backslashes = 0;
+        escaped.push(character);
+    }
+    escaped.extend(std::iter::repeat_n('\\', backslashes * 2));
+    escaped.push('"');
+    escaped
+}
+
+/// Escape one argument for the command-launch behavior OpenSSH uses for
+/// `ProxyCommand` on the current host platform.
+pub fn proxy_command_escape(value: &str) -> String {
+    #[cfg(not(windows))]
+    {
+        shell_escape(value)
+    }
+    #[cfg(windows)]
+    {
+        windows_command_line_escape(value)
+    }
+}
+
 /// Build the SSH `ProxyCommand` string used to tunnel to a sandbox.
 ///
-/// Every interpolated argument is shell-escaped so that server-supplied values
-/// (gateway URL, sandbox name, workspace, token, gateway name) cannot inject shell
-/// metacharacters into the command that OpenSSH executes via `/bin/sh -c`.
+/// On Unix, every interpolated argument is shell-escaped for the `/bin/sh -c`
+/// invocation used by OpenSSH. On Windows, every argument is quoted for the
+/// command line that OpenSSH launches through `CreateProcessW`.
 pub fn build_proxy_command(
     exe: &str,
     gateway_url: &str,
@@ -938,12 +982,12 @@ pub fn build_proxy_command(
 ) -> String {
     format!(
         "{} ssh-proxy --gateway {} --sandbox {} --workspace {} --token {} --gateway-name {}",
-        shell_escape(exe),
-        shell_escape(gateway_url),
-        shell_escape(sandbox_name),
-        shell_escape(workspace),
-        shell_escape(token),
-        shell_escape(gateway_name),
+        proxy_command_escape(exe),
+        proxy_command_escape(gateway_url),
+        proxy_command_escape(sandbox_name),
+        proxy_command_escape(workspace),
+        proxy_command_escape(token),
+        proxy_command_escape(gateway_name),
     )
 }
 
