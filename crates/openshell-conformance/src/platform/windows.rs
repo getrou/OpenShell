@@ -85,7 +85,7 @@ pub fn increment_then_wait(path: &str) -> Vec<String> {
         "/c".to_string(),
         format!(
             "set count=0 & (if exist \"{path}\" set /p count=<\"{path}\") & \
-             set /a count+=1 > NUL & >\"{path}\" echo !count! & \
+             set /a count+=1 > NUL & >\"{path}\" echo !count!& \
              set /p idle="
         ),
     ]
