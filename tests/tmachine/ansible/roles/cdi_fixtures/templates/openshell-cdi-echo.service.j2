@@ -1,0 +1,16 @@
+{# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
+{# SPDX-License-Identifier: Apache-2.0 #}
+[Unit]
+Description=OpenShell tmachine CDI Unix socket fixture
+After=local-fs.target
+
+[Service]
+# The socket is created by this process, not by PID 1, and `cat` echoes each
+# connection. A zero umask makes the socket connectable by any user.
+UMask=0000
+ExecStartPre=/bin/rm -f {{ cdi_scenario_dir }}/socket/echo.sock
+ExecStart=/usr/bin/systemd-socket-activate --listen={{ cdi_scenario_dir }}/socket/echo.sock --accept /bin/cat
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
